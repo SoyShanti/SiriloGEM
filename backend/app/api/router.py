@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
@@ -147,9 +148,12 @@ async def _generate_audio_pipeline(record_id: int, req: GenerateRequest):
         lang = req.validated_lyrics_language()
 
         audio_duration = req.duration_seconds or 30.0
+        similar = []
+        prompt_features = _prompt_features(req.prompt, req.mood)
+        ref_package = {}
+
         if not req.duration_seconds:
             ref_result = knowledge_base.search_by_reference(req.prompt)
-            prompt_features = _prompt_features(req.prompt, req.mood)
             if ref_result.get("found") and ref_result.get("features"):
                 ref_package = knowledge_base.get_reference_package_from_search(
                     ref_result=ref_result, genre=ref_result.get("genre_resolved") or req.genre,
@@ -165,16 +169,12 @@ async def _generate_audio_pipeline(record_id: int, req: GenerateRequest):
                 if durations:
                     avg_ms = sum(durations) / len(durations)
                     audio_duration = max(15.0, min(300.0, avg_ms / 1000.0))
-        else:
-            similar = []
-            prompt_features = _prompt_features(req.prompt, req.mood)
-            ref_package = {}
 
         vocal_language = lang or "en"
         if voice == "instrumental":
             lyrics_for_ace = None
         else:
-            lyrics_for_ace = req.lyrics or None
+            lyrics_for_ace = _clean_lyrics_for_ace(req.lyrics) if req.lyrics else None
 
         try:
             audio_path = await ace_step.generate(
@@ -280,6 +280,27 @@ def _ref_track_to_response(t, surprise_element):
         ref_weight=t.get("ref_weight", 0.60),
         surprise_element=surprise_element if t.get("ref_role") == "surprise" else None,
     )
+
+
+_PRODUCTION_RE = re.compile(
+    r"(?i)(fingerpick|steel guitar|vinyl|crackle|close-?mic|reverb|key change|vocal|fade[sd]?"
+    r"|whisper|drum|snare|slide|orchestr|instrument|bar[s]?\b|music|backing"
+    r"|harmon(?:y|ies)|pad[s]?|mix|pan|compress|limit|eq|filter|delay|chorus\s+eff)"
+)
+
+
+def _clean_lyrics_for_ace(lyrics: str) -> str:
+    cleaned = []
+    for line in lyrics.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            cleaned.append(line)
+            continue
+        if stripped and _PRODUCTION_RE.search(stripped):
+            continue
+        cleaned.append(line)
+    result = "\n".join(cleaned).strip()
+    return result if result else lyrics
 
 
 @router.post("/optimize-prompt", response_model=OptimizePromptResponse)
@@ -446,21 +467,22 @@ async def compose_lyrics(req: ComposeLyricsRequest):
 
     reference_lyrics = knowledge_base.get_lyrics_by_tracks(selected_tracks, limit=5)
 
-    ref_roles = {}
-    for t in selected_tracks:
-        tid = t.get("track_id", "")
-        ref_roles[tid] = {"role": t.get("ref_role", "primary"), "weight": t.get("ref_weight", 0.60)}
+    track_role_map = {
+        t.get("track_id"): {
+            "ref_role": t.get("ref_role", "primary"),
+            "ref_weight": t.get("ref_weight", 0.60),
+        }
+        for t in selected_tracks
+    }
 
     for lyric in reference_lyrics:
         tid = lyric.get("track_id", "")
-        if tid in ref_roles:
-            lyric["ref_role"] = ref_roles[tid]["role"]
-            lyric["ref_weight"] = ref_roles[tid]["weight"]
-        else:
-            lyric["ref_role"] = "primary"
-            lyric["ref_weight"] = 0.60
+        role_info = track_role_map.get(tid, {"ref_role": "primary", "ref_weight": 0.60})
+        lyric["ref_role"] = role_info["ref_role"]
+        lyric["ref_weight"] = role_info["ref_weight"]
 
     primary_lyrics = [l for l in reference_lyrics if l.get("ref_role") == "primary"]
+    logger.info(f"Primary lyrics for fingerprint: {[l.get('track') for l in primary_lyrics]}")
     artist_fingerprint = ""
     if primary_lyrics:
         try:
