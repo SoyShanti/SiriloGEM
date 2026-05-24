@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Space Grotesk", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --color-gem-50: #faf5ff;
+  --color-gem-100: #f3e8ff;
+  --color-gem-200: #e9d5ff;
+  --color-gem-300: #d8b4fe;
+  --color-gem-400: #c084fc;
+  --color-gem-500: #a855f7;
+  --color-gem-600: #9333ea;
+  --color-gem-700: #7e22ce;
+  --color-gem-800: #6b21f8;
+  --color-gem-900: #581c87;
+  --color-gem-950: #2e1065;
+  --color-surface: #0c0a14;
+  --color-surface-card: #14111f;
+  --color-surface-elevated: #1c1830;
+  --color-surface-hover: #241f3a;
+  --color-border-subtle: #2a2540;
+  --color-border-default: #3a3355;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-default) transparent;
+}
+
+::selection {
+  background: var(--color-gem-600);
+  color: white;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 20px rgba(168, 85, 247, 0.15); }
+  50% { box-shadow: 0 0 40px rgba(168, 85, 247, 0.3); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-6px); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.animate-pulse-glow { animation: pulse-glow 3s ease-in-out infinite; }
+.animate-float { animation: float 4s ease-in-out infinite; }
+.animate-shimmer {
+  background: linear-gradient(90deg, transparent, rgba(168, 85, 247, 0.1), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}
+.animate-spin-slow { animation: spin-slow 8s linear infinite; }
+
+.glass {
+  background: rgba(20, 17, 31, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.gradient-text {
+  background: linear-gradient(135deg, var(--color-gem-300), var(--color-gem-500), var(--color-gem-300));
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 4s linear infinite;
+}
