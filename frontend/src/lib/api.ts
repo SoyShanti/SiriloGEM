@@ -78,6 +78,7 @@ export interface PipelineTrace {
   lyrics_samples: LyricSample[]
   hit_profile_used?: Record<string, unknown>
   lm_prompt?: string
+  lyrics_full?: string
   lm_params?: {
     bpm: number
     key_scale: string
@@ -94,6 +95,7 @@ export interface PipelineTrace {
 }
 
 export interface GenerateRequest {
+  session_id: string
   prompt: string
   genre?: string
   mood?: string
@@ -132,6 +134,7 @@ export interface OptimizePromptRequest {
 }
 
 export interface OptimizePromptResponse {
+  session_id: string
   original_prompt: string
   optimized_prompt: string
   bpm: number
@@ -179,6 +182,7 @@ export interface OptimizePromptArtistRequest {
 }
 
 export interface ComposeLyricsRequest {
+  session_id: string
   prompt: string
   selected_track_ids: string[]
   genre?: string
@@ -189,6 +193,7 @@ export interface ComposeLyricsRequest {
 }
 
 export interface ComposeLyricsResponse {
+  session_id: string
   lyrics: string
   reference_count: number
 }

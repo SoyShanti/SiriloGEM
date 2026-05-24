@@ -1109,34 +1109,53 @@ class KnowledgeBase:
             trimmed_surprise = surprise_tracks[:max_surprise]
             reference_tracks = trimmed_primary + trimmed_contrast + trimmed_surprise
 
-            lyrics_ids = {t.get("track_id") for t in reference_tracks if t.get("track_id")}
+            # Construir lyrics_samples con ref_role propagado correctamente.
+            # Las letras PRIMARY reciben más texto y más slots; contrast y surprise
+            # reciben menos para que no diluyan la identidad del artista principal.
             lyrics_samples = []
-            if lyrics_ids:
-                lyrics_rows = db.query(Lyrics).filter(
-                    Lyrics.track_id.in_(list(lyrics_ids)),
-                    Lyrics.language == language,
-                ).limit(5).all()
-                for l in lyrics_rows:
-                    if l.lyrics_text:
-                        lyrics_samples.append({
-                            "track_id": l.track_id,
-                            "artist": l.artist_name,
-                            "track": l.track_name,
-                            "text": l.lyrics_text[:2000],
-                        })
 
-            if not lyrics_samples:
-                lyrics_rows = db.query(Lyrics).filter(
+            def _fetch_lyrics_for_bucket(track_bucket, role, weight, max_slots, max_chars):
+                ids = {t.get("track_id") for t in track_bucket if t.get("track_id")}
+                if not ids:
+                    return []
+                rows = db.query(Lyrics).filter(
+                    Lyrics.track_id.in_(list(ids)),
                     Lyrics.language == language,
-                    Lyrics.artist_name.ilike(f"%{primary_artist.split(',')[0].strip()}%"),
-                ).limit(3).all()
-                for l in lyrics_rows:
+                ).limit(max_slots).all()
+                result = []
+                for l in rows:
                     if l.lyrics_text:
-                        lyrics_samples.append({
+                        result.append({
+                            "track_id": l.track_id,
+                            "artist": l.artist_name,
+                            "track": l.track_name,
+                            "text": l.lyrics_text[:max_chars],
+                            "ref_role": role,
+                            "ref_weight": weight,
+                        })
+                return result
+
+            lyrics_samples += _fetch_lyrics_for_bucket(trimmed_primary,  "primary",  0.60, max_slots=3, max_chars=2000)
+            lyrics_samples += _fetch_lyrics_for_bucket(trimmed_contrast,  "contrast", 0.30, max_slots=1, max_chars=1000)
+            lyrics_samples += _fetch_lyrics_for_bucket(trimmed_surprise,  "surprise", 0.10, max_slots=1, max_chars=500)
+
+            # Fallback: si no se encontraron letras del artista principal,
+            # buscar directamente por nombre de artista.
+            if not any(l["ref_role"] == "primary" for l in lyrics_samples):
+                clean_primary = primary_artist.split(",")[0].strip()
+                fallback_rows = db.query(Lyrics).filter(
+                    Lyrics.language == language,
+                    Lyrics.artist_name.ilike(f"%{clean_primary}%"),
+                ).limit(3).all()
+                for l in fallback_rows:
+                    if l.lyrics_text:
+                        lyrics_samples.insert(0, {
                             "track_id": l.track_id,
                             "artist": l.artist_name,
                             "track": l.track_name,
                             "text": l.lyrics_text[:2000],
+                            "ref_role": "primary",
+                            "ref_weight": 0.60,
                         })
 
             combined_features = {}

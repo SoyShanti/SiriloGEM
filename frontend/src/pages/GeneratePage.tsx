@@ -106,6 +106,8 @@ export function GeneratePage() {
   const [expandedArtists, setExpandedArtists] = useState<string[]>([])
   const [genreOverride, setGenreOverride] = useState<string>('')
 
+  const [sessionId, setSessionId] = useState('')
+
   const [prompt, setPrompt] = useState('')
   const [genre, setGenre] = useState('')
   const [lyrics, setLyrics] = useState('')
@@ -177,6 +179,7 @@ export function GeneratePage() {
     setAutoMood('')
     setAutoParams(null)
     setExpandedArtists([])
+    setSessionId('')
     setError('')
   }, [])
 
@@ -247,22 +250,23 @@ export function GeneratePage() {
         custom_prompt: prompt.trim() || undefined,
         genre_override: genreOverride || undefined,
       })
-      setOptimized(res)
-      setPrompt(res.optimized_prompt)
-      setAutoMood(res.mood)
-      setRefTracks(res.reference_tracks)
-      const preSelected = new Set(res.reference_tracks.filter(t => t.selected).map(t => t.track_id))
-      setSelectedTrackIds(preSelected)
-      if (res.song_structure) setSongStructure(res.song_structure)
-      if (res.auto_params) setAutoParams(res.auto_params as typeof autoParams)
-      if (res.expanded_artists) setExpandedArtists(res.expanded_artists)
-      const selectedTracks = res.reference_tracks.filter(t => t.selected)
-      if (selectedTracks.length > 0) {
-        const avgDur = selectedTracks.reduce((sum, t) => sum + (t.duration_ms || 0), 0) / selectedTracks.length
-        if (avgDur > 0) setDuration(Math.round(avgDur / 1000))
-      }
-      setStep('optimized')
-    } catch (e) {
+    setOptimized(res)
+    setSessionId(res.session_id)
+    setPrompt(res.optimized_prompt)
+    setAutoMood(res.mood)
+    setRefTracks(res.reference_tracks)
+    const preSelected = new Set(res.reference_tracks.filter(t => t.selected).map(t => t.track_id))
+    setSelectedTrackIds(preSelected)
+    if (res.song_structure) setSongStructure(res.song_structure)
+    if (res.auto_params) setAutoParams(res.auto_params as typeof autoParams)
+    if (res.expanded_artists) setExpandedArtists(res.expanded_artists)
+    const selectedTracks = res.reference_tracks.filter(t => t.selected)
+    if (selectedTracks.length > 0) {
+      const avgDur = selectedTracks.reduce((sum, t) => sum + (t.duration_ms || 0), 0) / selectedTracks.length
+      if (avgDur > 0) setDuration(Math.round(avgDur / 1000))
+    }
+    setStep('optimized')
+  } catch (e) {
       setError(e instanceof Error ? e.message : 'Optimize failed')
     }
     setOptimizing(false)
@@ -279,10 +283,11 @@ export function GeneratePage() {
         mood: mood || undefined,
         voice_type: (voiceType as 'male' | 'female' | 'duet' | 'instrumental') || undefined,
       })
-      setOptimized(res)
-      setPrompt(res.optimized_prompt)
-      setAutoMood(res.mood)
-      setRefTracks(res.reference_tracks)
+    setOptimized(res)
+    setSessionId(res.session_id)
+    setPrompt(res.optimized_prompt)
+    setAutoMood(res.mood)
+    setRefTracks(res.reference_tracks)
       const preSelected = new Set(res.reference_tracks.filter(t => t.selected).map(t => t.track_id))
       setSelectedTrackIds(preSelected)
       if (res.song_structure) setSongStructure(res.song_structure)
@@ -308,6 +313,7 @@ export function GeneratePage() {
     setError('')
     try {
       const res = await api.composeLyrics({
+        session_id: sessionId,
         prompt: optimized.optimized_prompt,
         selected_track_ids: Array.from(selectedTrackIds),
         genre: genreOverride || genre || undefined,
@@ -317,6 +323,7 @@ export function GeneratePage() {
         lyrics_language: language || undefined,
       })
       setLyrics(res.lyrics)
+      if (res.session_id) setSessionId(res.session_id)
       setStep('lyrics')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Lyrics composition failed')
@@ -330,6 +337,7 @@ export function GeneratePage() {
     setError('')
     try {
       const res = await api.composeLyrics({
+        session_id: sessionId,
         prompt: optimized.optimized_prompt,
         selected_track_ids: Array.from(selectedTrackIds),
         genre: genreOverride || genre || undefined,
@@ -338,6 +346,7 @@ export function GeneratePage() {
         lyrics_language: language || undefined,
       })
       setLyrics(res.lyrics)
+      if (res.session_id) setSessionId(res.session_id)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Lyrics reroll failed')
     }
@@ -355,6 +364,7 @@ export function GeneratePage() {
     setPollingId(null)
     try {
       const req = {
+        session_id: sessionId,
         prompt: optimized.original_prompt,
         optimized_prompt: optimized.optimized_prompt,
         genre: genreOverride || genre || undefined,

@@ -826,21 +826,87 @@ class LMStudioClient:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 )
                 resp.raise_for_status()
-                text = resp.json()["choices"][0]["message"]["content"]
-                logger.info(f"LM Studio optimize raw response: {text[:500]}")
+            text = resp.json()["choices"][0]["message"]["content"]
+            logger.info(f"LM Studio optimize raw response: {text[:500]}")
 
-                parsed = self._parse_json_response(text)
-                return {
-                    "prompt": parsed.get("prompt", user_prompt),
-                    "bpm": parsed.get("bpm", 120),
-                    "key_scale": parsed.get("key_scale", "C major"),
-                    "time_signature": parsed.get("time_signature", "4/4"),
-                    "song_structure": parsed.get("song_structure", ""),
-                    "mood": parsed.get("mood", mood or ""),
-                }
+            parsed = self._parse_json_response(text)
+            return {
+                "prompt": parsed.get("prompt", user_prompt),
+                "bpm": parsed.get("bpm", 120),
+                "key_scale": parsed.get("key_scale", "C major"),
+                "time_signature": parsed.get("time_signature", "4/4"),
+                "song_structure": parsed.get("song_structure", ""),
+                "mood": parsed.get("mood", mood or ""),
+                "_lm_raw_response": text,
+                "_lm_parsed_response": parsed,
+                "_lm_success": bool(parsed),
+            }
         except Exception as e:
             logger.warning(f"LM Studio optimize_prompt failed: {e}")
             return default_result
+
+    async def analyze_artist_voice(self, primary_lyrics: list[dict]) -> str:
+        """
+        PASO PREVIO a compose_lyrics.
+        Analiza las letras del artista principal (ref_role='primary') y extrae
+        su huella estilística como bloque de texto listo para insertar en el system prompt.
+        Temperature muy baja — esto es análisis, no creación.
+        """
+        if not self._available or not primary_lyrics:
+            return ""
+
+        lyrics_text = "\n\n---\n\n".join([
+            f"[{s.get('track', '?')} — {s.get('artist', '?')}]\n{s.get('text', '')[:600]}"
+            for s in primary_lyrics[:3]
+        ])
+
+        system = (
+            "You are a musicologist analyzing song lyrics. "
+            "Your job is to extract precise stylistic patterns. "
+            "Respond ONLY with the analysis in the exact format requested. No preamble."
+        )
+        user = f"""Analyze these lyrics and extract the artist's stylistic fingerprint.
+
+LYRICS:
+{lyrics_text}
+
+Respond using EXACTLY this format (plain text, no JSON, no markdown):
+WORDS_PER_LINE: <average number, e.g. 7>
+RHYME: <AABB|ABAB|libre|mixto>
+VOCABULARY: <10 most characteristic words, comma-separated>
+THEMES: <3 recurring themes, comma-separated>
+OBJECTS: <5 concrete physical objects the artist mentions, comma-separated>
+VERBS: <8 dominant verbs, comma-separated>
+STYLE: <directo|metafórico|narrativo|confesional>
+POV: <primera|segunda|tercera>
+TENSE: <pasado|presente|mixto>
+NEVER: <3 things this artist NEVER does, pipe-separated, e.g.: usa metáforas de más de 4 palabras|menciona tecnología moderna|deja una emoción sin ancla física>
+SIGNATURE: <1 example of a characteristic phrase construction, e.g.: "verb + concrete object + emotional consequence">"""
+
+        payload = {
+            "model": self._model_id or "local-model",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": 400,
+            "temperature": 0.1,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                resp.raise_for_status()
+                result = resp.json()["choices"][0]["message"]["content"].strip()
+                logger.info(f"analyze_artist_voice result: {result[:200]}")
+                return result
+        except Exception as e:
+            logger.warning(f"analyze_artist_voice failed: {e}")
+            return ""
 
     async def compose_lyrics(
         self,
@@ -851,6 +917,7 @@ class LMStudioClient:
         lyrics_language: Optional[str] = None,
         genre: Optional[str] = None,
         mood: Optional[str] = None,
+        artist_fingerprint: str = "",
     ) -> str:
         if not self._available:
             raise RuntimeError("LM Studio is not available")
@@ -864,6 +931,25 @@ class LMStudioClient:
         mood_genre_override = _build_mood_genre_override(mood, genre)
         if mood_genre_override:
             system_prompt += mood_genre_override
+
+        # Fingerprint del artista principal: se inserta como restricción dura.
+        # Tiene prioridad sobre las instrucciones genéricas de género porque viene
+        # de las letras reales del artista, no de un template.
+        if artist_fingerprint:
+            system_prompt += (
+                "\n\n═══ ARTIST VOICE FINGERPRINT — MANDATORY RULES ═══\n"
+                "These rules are extracted from the PRIMARY artist's actual songs.\n"
+                "They OVERRIDE any generic genre instruction above.\n\n"
+                f"{artist_fingerprint}\n\n"
+                "APPLY THE FINGERPRINT:\n"
+                "- Use VOCABULARY and OBJECTS listed above — they are the artist's language.\n"
+                "- Stay within WORDS_PER_LINE (±1 word max).\n"
+                "- Follow the RHYME scheme exactly.\n"
+                "- Write from the POV and TENSE specified.\n"
+                "- The NEVER rules are absolute — any violation disqualifies the output.\n"
+                "- Write AS this artist, not inspired by them.\n"
+                "═══════════════════════════════════════════════════"
+            )
 
         lang_map = {
             "es": "Spanish", "en": "English", "pt": "Portuguese",
@@ -938,37 +1024,49 @@ class LMStudioClient:
             )
             resp.raise_for_status()
             lyrics_text = resp.json()["choices"][0]["message"]["content"].strip()
+            raw_lyrics = lyrics_text
             lyrics_text = lyrics_text.removeprefix("```").removeprefix("lyrics").removesuffix("```").strip()
-            return lyrics_text
+        return {"lyrics": lyrics_text, "_lm_raw_response": raw_lyrics}
 
     def _parse_json_response(self, text: str) -> dict:
-        profile = self._active_profile
         text = text.strip()
+        if not text:
+            return {}
 
+        # Strip markdown fences (```json ... ``` or ``` ... ```)
         if text.startswith("```"):
             lines = text.split("\n")
-            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            start_idx = 1
+            end_idx = len(lines)
+            if lines[-1].strip().startswith("```"):
+                end_idx = len(lines) - 1
+            text = "\n".join(lines[start_idx:end_idx]).strip()
 
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            candidate = text[start:end + 1]
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+        # Also strip mid-text fences
+        text = text.replace("```json", "").replace("```", "")
 
-        if profile and profile.json_reliability in ("low", "medium"):
-            cleaned = text.replace("```json", "").replace("```", "").replace("\n", " ")
-            s = cleaned.find("{")
-            e = cleaned.rfind("}")
-            if s >= 0 and e > s:
+        # Strategy 1: try the whole text as JSON
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: find the largest valid JSON object by trying each { position
+        best = {}
+        for i in range(len(text)):
+            if text[i] != "{":
+                continue
+            for j in range(len(text), i, -1):
+                candidate = text[i:j]
                 try:
-                    return json.loads(cleaned[s:e + 1])
+                    parsed = json.loads(candidate)
+                    if len(str(parsed)) > len(str(best)):
+                        best = parsed
+                    break
                 except json.JSONDecodeError:
-                    pass
+                    continue
 
-        return {}
+        return best
 
     async def craft_prompt(self, reference_package: dict, user_prompt: str,
                            genre: Optional[str] = None, mood: Optional[str] = None,

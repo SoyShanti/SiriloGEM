@@ -95,12 +95,14 @@ class PipelineTrace(BaseModel):
     lyrics_samples: list[LyricSample] = []
     hit_profile_used: Optional[dict] = None
     lm_prompt: Optional[str] = None
+    lyrics_full: Optional[str] = None
     lm_params: Optional[dict] = None
     comparison: Optional[dict] = None
     ref_result: Optional[dict] = None
 
 
 class GenerateRequest(BaseModel):
+    session_id: str = ""
     prompt: str = Field(..., min_length=3, max_length=2000, description="Text description of the music to generate")
     genre: Optional[str] = Field(None, description="Target genre")
     mood: Optional[str] = Field(None, description="Target mood")
@@ -200,6 +202,7 @@ class OptimizePromptRequest(BaseModel):
 
 
 class OptimizePromptResponse(BaseModel):
+    session_id: str = ""
     original_prompt: str
     optimized_prompt: str
     bpm: int = 120
@@ -216,6 +219,7 @@ class OptimizePromptResponse(BaseModel):
 
 
 class ComposeLyricsRequest(BaseModel):
+    session_id: str = ""
     prompt: str = Field(..., min_length=3, max_length=4000)
     selected_track_ids: list[str] = Field(..., min_length=1, max_length=10)
     genre: Optional[str] = None
@@ -241,6 +245,7 @@ class ComposeLyricsRequest(BaseModel):
 
 
 class ComposeLyricsResponse(BaseModel):
+    session_id: str = ""
     lyrics: str
     reference_count: int = 0
 

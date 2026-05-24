@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
@@ -16,6 +17,7 @@ from backend.app.schemas.schemas import (
     ArtistSearchResult, ArtistStats, OptimizePromptArtistRequest,
 )
 from backend.app.services.knowledge_base import MOOD_PRESETS
+from backend.app.services.pipeline_logger import start_session, append_step, update_step, get_step_data
 
 router = APIRouter()
 logger = logging.getLogger("spotigem")
@@ -101,6 +103,28 @@ async def generate_track(req: GenerateRequest, background_tasks: BackgroundTasks
     db.add(gen_record)
     db.commit()
     db.refresh(gen_record)
+
+    gen_trace = {
+        "trace_id": f"gen_{gen_record.id}_{int(time.time())}",
+        "step": "generate",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "record_id": gen_record.id,
+        "original_prompt": req.prompt,
+        "optimized_prompt": req.optimized_prompt,
+        "final_prompt": req.optimized_prompt or req.prompt,
+        "genre": req.genre, "mood": req.mood,
+        "lyrics_provided": bool(req.lyrics),
+        "lyrics_full": req.lyrics or "",
+        "voice_type": req.voice_type, "lyrics_language": req.lyrics_language,
+        "bpm": req.bpm, "key_scale": req.key_scale, "time_signature": req.time_signature,
+        "song_structure": req.song_structure, "duration_seconds": req.duration_seconds,
+    }
+    try:
+        append_step(req.session_id, "generate_input", gen_trace)
+        logger.info(f"Generate trace appended to session: {req.session_id}")
+    except Exception as e:
+        logger.warning(f"Failed to append generate trace: {e}")
+
     background_tasks.add_task(_generate_audio_pipeline, gen_record.id, req)
     return GenerateResponse(id=gen_record.id, audio_path="pending", prompt=req.optimized_prompt or req.prompt, genre=req.genre, hit_prediction_score=0.0, message="Generation queued")
 
@@ -160,8 +184,16 @@ async def _generate_audio_pipeline(record_id: int, req: GenerateRequest):
                 vocal_language=vocal_language,
             )
             record.audio_path = audio_path
+            try:
+                update_step(req.session_id, "generate_result", {"audio_path": audio_path, "status": "audio_generated"})
+            except Exception:
+                pass
         except Exception as e:
             record.hit_prediction_label = f"ace_error: {e}"
+            try:
+                update_step(req.session_id, "generate_result", {"status": "ace_error", "error": str(e)})
+            except Exception:
+                pass
             db.commit()
             db.close()
             return
@@ -182,6 +214,15 @@ async def _generate_audio_pipeline(record_id: int, req: GenerateRequest):
         record.hit_prediction_label = prediction["hit_label"]
         comparison = hit_predictor.compare_with_reference(features_for_prediction, similar)
 
+        try:
+            update_step(req.session_id, "generate_result", {
+                "hit_score": prediction["hit_score"],
+                "hit_label": prediction["hit_label"],
+                "comparison": comparison,
+            })
+        except Exception:
+            pass
+
         trace_similar = []
         for t in similar[:5]:
             trace_similar.append(ReferenceTrack(
@@ -197,7 +238,7 @@ async def _generate_audio_pipeline(record_id: int, req: GenerateRequest):
         trace = PipelineTrace(
             reference_tracks=trace_similar, lyrics_samples=[],
             hit_profile_used=ref_package.get("profile"),
-            lm_prompt=final_prompt,
+            lm_prompt=final_prompt, lyrics_full=req.lyrics or "",
             lm_params={"bpm": bpm, "key_scale": key_scale, "time_signature": time_sig, "song_structure": song_structure},
             comparison=comparison,
         )
@@ -217,8 +258,36 @@ async def _generate_audio_pipeline(record_id: int, req: GenerateRequest):
         db.close()
 
 
+def _track_summary(t):
+    return {"track_id": t.get("track_id"), "track_name": t.get("track_name"), "artist_name": t.get("artist_name"),
+            "track_genre": t.get("track_genre"), "ref_role": t.get("ref_role"), "ref_weight": t.get("ref_weight"),
+            "selected": t.get("selected", False)}
+
+
+def _ref_track_to_response(t, surprise_element):
+    return ReferenceTrackWithSelection(
+        track_id=t.get("track_id", ""), track_name=t.get("track_name", "?"),
+        artist_name=t.get("artist_name", "?"), track_genre=t.get("track_genre"),
+        popularity=t.get("popularity", 0), duration_ms=t.get("duration_ms"),
+        danceability=t.get("danceability", 0.5), energy=t.get("energy", 0.5),
+        valence=t.get("valence", 0.5), tempo=t.get("tempo", 120),
+        loudness=t.get("loudness"), key=t.get("key"), mode=t.get("mode"),
+        speechiness=t.get("speechiness"), acousticness=t.get("acousticness"),
+        instrumentalness=t.get("instrumentalness"), liveness=t.get("liveness"),
+        time_signature=t.get("time_signature"), similarity_score=t.get("similarity_score", 0),
+        combined_score=t.get("combined_score", 0), has_lyrics=t.get("has_lyrics", False),
+        selected=t.get("selected", False), ref_role=t.get("ref_role", "primary"),
+        ref_weight=t.get("ref_weight", 0.60),
+        surprise_element=surprise_element if t.get("ref_role") == "surprise" else None,
+    )
+
+
 @router.post("/optimize-prompt", response_model=OptimizePromptResponse)
 async def optimize_prompt(req: OptimizePromptRequest):
+    session_id = f"sess_{int(time.time())}"
+    start_session(session_id)
+    append_step(session_id, "optimize_input", {"mode": "custom", "original_prompt": req.prompt, "genre": req.genre, "mood": req.mood})
+
     ref_result = knowledge_base.search_by_reference(req.prompt)
     prompt_features = _prompt_features(req.prompt, req.mood)
 
@@ -235,80 +304,53 @@ async def optimize_prompt(req: OptimizePromptRequest):
 
     reference_tracks, surprise_element = knowledge_base.get_reference_tracks(
         features=ref_result.get("features") or prompt_features,
-        genre=genre,
-        artist_tracks=artist_tracks,
-        artist_subgenres=artist_subgenres,
-        limit=10,
+        genre=genre, artist_tracks=artist_tracks, artist_subgenres=artist_subgenres, limit=10,
     )
+    append_step(session_id, "kb_tracks", {"tracks": [_track_summary(t) for t in reference_tracks], "surprise_element": surprise_element})
 
     available_moods = list(MOOD_PRESETS.keys())
 
     lm_result = await lm_studio.optimize_prompt(
-        reference_tracks=reference_tracks,
-        user_prompt=req.prompt,
-        genre=genre,
-        mood=req.mood,
-        voice_type=req.validated_voice_type(),
-        hit_profile=hit_profile,
-        available_moods=available_moods,
-        surprise_element=surprise_element,
+        reference_tracks=reference_tracks, user_prompt=req.prompt, genre=genre,
+        mood=req.mood, voice_type=req.validated_voice_type(),
+        hit_profile=hit_profile, available_moods=available_moods, surprise_element=surprise_element,
     )
+    append_step(session_id, "lm_optimize", {
+        "raw_response": lm_result.get("_lm_raw_response", ""),
+        "parsed_response": lm_result.get("_lm_parsed_response", {}),
+        "success": lm_result.get("_lm_success", False),
+        "optimized_prompt": lm_result.get("prompt", req.prompt),
+        "bpm": lm_result.get("bpm", 120), "key_scale": lm_result.get("key_scale", "C major"),
+        "time_signature": lm_result.get("time_signature", "4/4"),
+    })
 
-    ref_tracks_response = []
-    for t in reference_tracks:
-        ref_tracks_response.append(ReferenceTrackWithSelection(
-            track_id=t.get("track_id", ""),
-            track_name=t.get("track_name", "?"),
-            artist_name=t.get("artist_name", "?"),
-            track_genre=t.get("track_genre"),
-            popularity=t.get("popularity", 0),
-            duration_ms=t.get("duration_ms"),
-            danceability=t.get("danceability", 0.5),
-            energy=t.get("energy", 0.5),
-            valence=t.get("valence", 0.5),
-            tempo=t.get("tempo", 120),
-            loudness=t.get("loudness"),
-            key=t.get("key"),
-            mode=t.get("mode"),
-            speechiness=t.get("speechiness"),
-            acousticness=t.get("acousticness"),
-            instrumentalness=t.get("instrumentalness"),
-            liveness=t.get("liveness"),
-            time_signature=t.get("time_signature"),
-            similarity_score=t.get("similarity_score", 0),
-            combined_score=t.get("combined_score", 0),
-            has_lyrics=t.get("has_lyrics", False),
-            selected=t.get("selected", False),
-            ref_role=t.get("ref_role", "primary"),
-            ref_weight=t.get("ref_weight", 0.60),
-            surprise_element=surprise_element if t.get("ref_role") == "surprise" else None,
-        ))
+    ref_tracks_response = [_ref_track_to_response(t, surprise_element) for t in reference_tracks]
 
-    return OptimizePromptResponse(
-        original_prompt=req.prompt,
-        optimized_prompt=lm_result.get("prompt", req.prompt),
-        bpm=lm_result.get("bpm", 120),
-        key_scale=lm_result.get("key_scale", "C major"),
+    result = OptimizePromptResponse(
+        session_id=session_id,
+        original_prompt=req.prompt, optimized_prompt=lm_result.get("prompt", req.prompt),
+        bpm=lm_result.get("bpm", 120), key_scale=lm_result.get("key_scale", "C major"),
         time_signature=lm_result.get("time_signature", "4/4"),
-        song_structure=lm_result.get("song_structure", ""),
-        mood=lm_result.get("mood", req.mood or ""),
+        song_structure=lm_result.get("song_structure", ""), mood=lm_result.get("mood", req.mood or ""),
         reference_tracks=ref_tracks_response,
-        ref_found=ref_result.get("found", False),
-        ref_type=ref_result.get("ref_type"),
-        ref_name=ref_result.get("ref_name"),
+        ref_found=ref_result.get("found", False), ref_type=ref_result.get("ref_type"), ref_name=ref_result.get("ref_name"),
     )
+    logger.info(f"Optimize session: {session_id}")
+    return result
 
 
 @router.post("/optimize-prompt-artist", response_model=OptimizePromptResponse)
 async def optimize_prompt_artist(req: OptimizePromptArtistRequest):
-    pkg = knowledge_base.get_artist_reference_package(
-        primary_artist=req.primary_artist,
-        secondary_artists=req.secondary_artists,
-        language=req.language,
-        features=None,
-        genre_override=req.genre_override,
-    )
+    session_id = f"sess_{int(time.time())}"
+    start_session(session_id)
+    append_step(session_id, "optimize_input", {"mode": "artist", "primary_artist": req.primary_artist,
+        "secondary_artists": req.secondary_artists, "language": req.language,
+        "genre_override": req.genre_override, "custom_prompt": req.custom_prompt})
 
+    pkg = knowledge_base.get_artist_reference_package(
+        primary_artist=req.primary_artist, secondary_artists=req.secondary_artists,
+        language=req.language, features=None, genre_override=req.genre_override,
+    )
     auto_params = pkg.get("auto_params", {})
     reference_tracks = pkg.get("reference_tracks", [])
     surprise_element = pkg.get("surprise_element")
@@ -317,81 +359,53 @@ async def optimize_prompt_artist(req: OptimizePromptArtistRequest):
     derived_mood = auto_params.get("derived_mood", "")
     dominant_genre = auto_params.get("dominant_genre", "")
 
-    all_artists = [req.primary_artist] + req.secondary_artists[:2]
-    if req.custom_prompt:
-        user_prompt = req.custom_prompt
-    else:
-        user_prompt = f"estilo {req.primary_artist}"
-        if req.secondary_artists:
-            user_prompt += " + " + " + ".join(req.secondary_artists[:2])
+    append_step(session_id, "kb_tracks", {"auto_params": auto_params, "expanded_artists": expanded_artists,
+        "tracks": [_track_summary(t) for t in reference_tracks], "surprise_element": surprise_element})
+
+    user_prompt = req.custom_prompt or f"estilo {req.primary_artist}"
+    if req.secondary_artists:
+        user_prompt += " + " + " + ".join(req.secondary_artists[:2])
 
     available_moods = list(MOOD_PRESETS.keys())
 
     lm_result = await lm_studio.optimize_prompt(
-        reference_tracks=reference_tracks,
-        user_prompt=user_prompt,
-        genre=dominant_genre,
-        mood=derived_mood,
-        voice_type=req.validated_voice_type(),
-        hit_profile=profile,
-        available_moods=available_moods,
-        surprise_element=surprise_element,
+        reference_tracks=reference_tracks, user_prompt=user_prompt, genre=dominant_genre,
+        mood=derived_mood, voice_type=req.validated_voice_type(), hit_profile=profile,
+        available_moods=available_moods, surprise_element=surprise_element,
     )
+    append_step(session_id, "lm_optimize", {
+        "raw_response": lm_result.get("_lm_raw_response", ""),
+        "parsed_response": lm_result.get("_lm_parsed_response", {}),
+        "success": lm_result.get("_lm_success", False),
+        "optimized_prompt": lm_result.get("prompt", user_prompt),
+        "bpm": lm_result.get("bpm", auto_params.get("bpm", 120)),
+        "key_scale": lm_result.get("key_scale", auto_params.get("key_scale", "C major")),
+        "time_signature": lm_result.get("time_signature", "4/4"),
+    })
 
-    ref_tracks_response = []
-    for t in reference_tracks:
-        ref_tracks_response.append(ReferenceTrackWithSelection(
-            track_id=t.get("track_id", ""),
-            track_name=t.get("track_name", "?"),
-            artist_name=t.get("artist_name", "?"),
-            track_genre=t.get("track_genre"),
-            popularity=t.get("popularity", 0),
-            duration_ms=t.get("duration_ms"),
-            danceability=t.get("danceability", 0.5),
-            energy=t.get("energy", 0.5),
-            valence=t.get("valence", 0.5),
-            tempo=t.get("tempo", 120),
-            loudness=t.get("loudness"),
-            key=t.get("key"),
-            mode=t.get("mode"),
-            speechiness=t.get("speechiness"),
-            acousticness=t.get("acousticness"),
-            instrumentalness=t.get("instrumentalness"),
-            liveness=t.get("liveness"),
-            time_signature=t.get("time_signature"),
-            similarity_score=t.get("similarity_score", 0),
-            combined_score=t.get("combined_score", 0),
-            has_lyrics=t.get("has_lyrics", False),
-            selected=t.get("selected", False),
-            ref_role=t.get("ref_role", "primary"),
-            ref_weight=t.get("ref_weight", 0.60),
-            surprise_element=surprise_element if t.get("ref_role") == "surprise" else None,
-        ))
-
+    ref_tracks_response = [_ref_track_to_response(t, surprise_element) for t in reference_tracks]
     bpm = lm_result.get("bpm", auto_params.get("bpm", 120))
     key_scale = lm_result.get("key_scale", auto_params.get("key_scale", "C major"))
     time_sig = lm_result.get("time_signature", "4/4")
 
-    return OptimizePromptResponse(
-        original_prompt=user_prompt,
-        optimized_prompt=lm_result.get("prompt", user_prompt),
-        bpm=bpm,
-        key_scale=key_scale,
-        time_signature=time_sig,
-        song_structure=lm_result.get("song_structure", ""),
-        mood=lm_result.get("mood", derived_mood),
-        reference_tracks=ref_tracks_response,
-        ref_found=True,
-        ref_type="artist",
-        ref_name=req.primary_artist,
-        auto_params=auto_params,
-        expanded_artists=expanded_artists,
+    result = OptimizePromptResponse(
+        session_id=session_id,
+        original_prompt=user_prompt, optimized_prompt=lm_result.get("prompt", user_prompt),
+        bpm=bpm, key_scale=key_scale, time_signature=time_sig,
+        song_structure=lm_result.get("song_structure", ""), mood=lm_result.get("mood", derived_mood),
+        reference_tracks=ref_tracks_response, ref_found=True, ref_type="artist",
+        ref_name=req.primary_artist, auto_params=auto_params, expanded_artists=expanded_artists,
     )
+    logger.info(f"Optimize-artist session: {session_id}")
+    return result
 
 
 @router.post("/compose-lyrics", response_model=ComposeLyricsResponse)
 async def compose_lyrics(req: ComposeLyricsRequest):
-    logger.info(f"compose-lyrics request: prompt_len={len(req.prompt)}, track_ids={len(req.selected_track_ids)}, genre={req.genre}, mood={req.mood}, voice={req.voice_type}, lang={req.lyrics_language}")
+    session_id = req.session_id or f"sess_{int(time.time())}"
+    if session_id and not session_id.startswith("sess_"):
+        session_id = f"sess_{session_id}"
+
     if not lm_studio.is_available():
         raise HTTPException(status_code=503, detail="LM Studio not available")
 
@@ -405,6 +419,24 @@ async def compose_lyrics(req: ComposeLyricsRequest):
     if not selected_tracks:
         db_tracks = knowledge_base.search_tracks(genre=genre, limit=len(req.selected_track_ids))
         selected_tracks = db_tracks[:len(req.selected_track_ids)]
+
+    kb_step = get_step_data(session_id, "kb_tracks")
+    kb_roles = {}
+    if kb_step and kb_step.get("tracks"):
+        for t in kb_step["tracks"]:
+            kb_roles[t.get("track_id")] = {"ref_role": t.get("ref_role", "primary"), "ref_weight": t.get("ref_weight", 0.60)}
+
+    for t in selected_tracks:
+        tid = t.get("track_id", "")
+        if tid in kb_roles:
+            t["ref_role"] = kb_roles[tid]["ref_role"]
+            t["ref_weight"] = kb_roles[tid]["ref_weight"]
+
+    append_step(session_id, "user_track_selection", {
+        "selected_track_ids": req.selected_track_ids,
+        "tracks": [_track_summary(t) for t in selected_tracks],
+        "genre": genre, "mood": req.mood, "voice_type": req.voice_type, "lyrics_language": req.lyrics_language,
+    })
 
     if not genre and selected_tracks:
         track_genres = [t.get("track_genre", "") for t in selected_tracks if t.get("track_genre")]
@@ -428,18 +460,35 @@ async def compose_lyrics(req: ComposeLyricsRequest):
             lyric["ref_role"] = "primary"
             lyric["ref_weight"] = 0.60
 
+    primary_lyrics = [l for l in reference_lyrics if l.get("ref_role") == "primary"]
+    artist_fingerprint = ""
+    if primary_lyrics:
+        try:
+            artist_fingerprint = await lm_studio.analyze_artist_voice(primary_lyrics)
+        except Exception as e:
+            logger.warning(f"analyze_artist_voice failed (non-fatal): {e}")
+
     try:
-        lyrics = await lm_studio.compose_lyrics(
-            prompt=req.prompt,
-            reference_lyrics=reference_lyrics,
-            voice_type=req.validated_voice_type(),
-            backing_vocals=req.validated_backing_vocals(),
-            lyrics_language=req.validated_lyrics_language(),
-            genre=genre,
-            mood=req.mood,
+        compose_result = await lm_studio.compose_lyrics(
+            prompt=req.prompt, reference_lyrics=reference_lyrics,
+            voice_type=req.validated_voice_type(), backing_vocals=req.validated_backing_vocals(),
+            lyrics_language=req.validated_lyrics_language(), genre=genre, mood=req.mood,
+            artist_fingerprint=artist_fingerprint,
         )
-        return ComposeLyricsResponse(lyrics=lyrics, reference_count=len(reference_lyrics))
+        lyrics = compose_result["lyrics"] if isinstance(compose_result, dict) else compose_result
+        compose_raw = compose_result.get("_lm_raw_response", "") if isinstance(compose_result, dict) else ""
+
+        append_step(session_id, "lm_compose", {
+            "raw_response": compose_raw, "composed_lyrics": lyrics,
+            "reference_lyrics_sources": [{"track_id": l.get("track_id"), "artist": l.get("artist"),
+                "track": l.get("track"), "ref_role": l.get("ref_role"), "ref_weight": l.get("ref_weight"),
+                "lyrics_excerpt": (l.get("text", "") or "")[:500]} for l in reference_lyrics],
+            "artist_fingerprint": artist_fingerprint,
+        })
+
+        return ComposeLyricsResponse(session_id=session_id, lyrics=lyrics, reference_count=len(reference_lyrics))
     except Exception as e:
+        append_step(session_id, "lm_compose_error", {"error": str(e)})
         raise HTTPException(status_code=500, detail=f"Lyrics composition failed: {e}")
 
 
